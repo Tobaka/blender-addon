@@ -542,6 +542,7 @@ class OBJECT_OT_render_lightfield(bpy.types.Operator):
             
         depth_view_node = bpy.data.scenes[scene_key].node_tree.nodes.new('CompositorNodeViewer')
         depth_view_node.use_alpha = False
+        depth_view_node.name = 'LF_DEPTH_VIEW'
         left = depth_view_node.inputs[0]
         bpy.data.scenes[scene_key].node_tree.links.new(right, left)
 
