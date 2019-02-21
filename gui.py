@@ -82,6 +82,7 @@ class VIEW3D_OT_lightfield_setup(bpy.types.Panel):
         col.prop(LF, "sequence_steps")
         col.prop(LF, "save_depth_for_all_views")
         col.prop(LF, "save_object_id_maps_for_all_views")
+        col.prop(LF, "render_on_network")
         col.operator("scene.render_lightfield", "Render Light Field", icon="HAND")
 
         col = layout.column(align=True)

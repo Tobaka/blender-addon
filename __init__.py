@@ -145,6 +145,11 @@ class LFPropertyGroup(bpy.types.PropertyGroup):
         default=False,
         description='Whether to save disp/depth maps for all views or only for center view.'
     )
+    render_on_network = BoolProperty(
+        name='render over the network',
+        default=False,
+        description='Whether the lightfield should be rendered locally or remotely'
+    )
     save_object_id_maps_for_all_views = BoolProperty(
         name='save object id maps for all views',
         default=False,

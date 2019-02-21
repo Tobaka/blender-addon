@@ -37,6 +37,7 @@ import random
 import shutil
 
 import numpy as np
+from time import sleep
 
 from math import *
 from mathutils import *
@@ -392,7 +393,7 @@ class OBJECT_OT_render_lightfield(bpy.types.Operator):
         current_antialiasing = bpy.context.scene.render.use_antialiasing
 
         # change settings for high resolution rendering
-        bpy.data.scenes[bpy.context.scene.name].render.resolution_percentage = 100 * LF.depth_map_scale
+        bpy.data.scenes[scene_key].render.resolution_percentage = 100 * LF.depth_map_scale
         bpy.context.scene.render.engine = 'BLENDER_RENDER'
         bpy.context.scene.render.use_antialiasing = False
 
@@ -426,69 +427,152 @@ class OBJECT_OT_render_lightfield(bpy.types.Operator):
 
     def render_input_views(self, cameras, scene_key, LF, tgt_dir):
 
+        if not bpy.data.scenes[scene_key].LF.render_on_network:
+            # create image output node
+            image_out_node = bpy.data.scenes[scene_key].node_tree.nodes.new(type='CompositorNodeOutputFile')
+            image_out_node.format.file_format = 'PNG'
+            image_out_node.format.color_mode = 'RGB'
+            image_out_node.format.color_depth = '8'
+            image_out_node.name = 'LF_IMAGE_OUTPUT'
 
-        # create image output node
-        image_out_node = bpy.data.scenes[scene_key].node_tree.nodes.new(type='CompositorNodeOutputFile')
-        image_out_node.format.file_format = 'PNG'
-        image_out_node.format.color_mode = 'RGB'
-        image_out_node.format.color_depth = '8'
-        image_out_node.name = 'LF_IMAGE_OUTPUT'
+            # connect nodes
+            right = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs['Image']
+            left = image_out_node.inputs['Image']
+            bpy.data.scenes[scene_key].node_tree.links.new(right, left)
 
-        # connect nodes
-        right = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs['Image']
-        left = image_out_node.inputs['Image']
-        bpy.data.scenes[scene_key].node_tree.links.new(right, left)
+            bpy.data.scenes[scene_key].render.filepath = os.path.join(bpy.path.abspath(LF.tgt_dir), "unused_blenderender_output")
 
-        bpy.data.scenes[scene_key].render.filepath = os.path.join(bpy.path.abspath(LF.tgt_dir), "unused_blenderender_output")
+            image_out_node.base_path = tgt_dir
 
-        image_out_node.base_path = tgt_dir
+            # render view per camera
+            c_image = 'Image'
+            for cam_idx, camera in enumerate(cameras):
+                print("Rendering scene with camera: " + camera.name)
+                image_filename = 'input_' + self.get_raw_camera_name(camera.name)
+                image_out_node.file_slots[c_image].path = image_filename + '_frame###'
+                c_image = image_filename + '_frame###'
 
-        # render view per camera
-        c_image = 'Image'
-        for cam_idx, camera in enumerate(cameras):
-            print("Rendering scene with camera: " + camera.name)
-            image_filename = 'input_' + self.get_raw_camera_name(camera.name)
-            image_out_node.file_slots[c_image].path = image_filename + '_frame###'
-            c_image = image_filename + '_frame###'
+                # set scene camera to current light field camera
+                bpy.data.scenes[scene_key].camera = camera
 
-            # set scene camera to current light field camera
-            bpy.data.scenes[scene_key].camera = camera
+                # change seed
+                bpy.data.scenes[scene_key].cycles.seed = LF.cycles_seed + cam_idx
+                print("Cycles seed for camera %d: %d" % (cam_idx, bpy.data.scenes[scene_key].cycles.seed))
 
-            # change seed
-            bpy.data.scenes[scene_key].cycles.seed = LF.cycles_seed + cam_idx
-            print("Cycles seed for camera %d: %d" % (cam_idx, bpy.data.scenes[scene_key].cycles.seed))
+                # render scene and adjust the file name
+                bpy.ops.render.render(write_still=True)
+                self.remove_blender_frame_from_file_name(image_filename, tgt_dir)
 
-            # render scene and adjust the file name
-            bpy.ops.render.render(write_still=True)
-            self.remove_blender_frame_from_file_name(image_filename, tgt_dir)
+            # remove the image output node
+#            bpy.context.scene.node_tree.nodes.remove(image_out_node)
 
-        # remove the image output node
-        bpy.context.scene.node_tree.nodes.remove(image_out_node)
+        else:  # NET_RENDER
+            import netrender
+
+            scene = bpy.data.scenes[scene_key]
+
+            current_rlayers_status = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].mute
+            current_save_status = scene.network_render.save_before_job
+
+            scene.network_render.save_before_job = True
+            bpy.context.scene.render.engine = 'CYCLES'
+
+            networkjoblist = []
+
+            # send render jobs to the network
+            for cam_idx, camera in enumerate(cameras):
+                print("Rendering scene with camera: " + camera.name)
+                # set scene camera to current light field camera
+                bpy.data.scenes[scene_key].camera = camera
+
+                # change seed
+                bpy.data.scenes[scene_key].cycles.seed = LF.cycles_seed + cam_idx
+                print("Cycles seed for camera {}: {}".format(
+                    cam_idx,
+                    bpy.data.scenes[scene_key].cycles.seed))
+
+                # send to render on the network
+                conn = netrender.utils.clientConnection(scene.network_render, report=self.report)
+                job_id = netrender.client.sendJob(conn, scene, False)
+                networkjoblist.append(job_id)
+                print("Job sent to master")
+
+            scene.node_tree.nodes['Render Layers'].mute = True
+
+            # fetch results and create output files
+            image_in_node = None
+            image_out_node = None
+            c_image = 'Image'
+            for cam_idx, camera in enumerate(cameras):
+                print("Waiting for result of camera {}...".format(cam_idx))
+                job_id = networkjoblist[cam_idx]
+                netrender.client.requestResult(conn, job_id, scene.frame_current)
+                response = conn.getresponse()
+                buf = response.read()
+
+                while response.status == 202:
+                    sleep(1)
+                    netrender.client.requestResult(conn, job_id, scene.frame_current)
+                    response = conn.getresponse()
+                    buf = response.read()
+
+                print("Writing netrender result...")
+                filepath = os.path.join(bpy.path.abspath(LF.tgt_dir), 'netrender_output.exr')
+                f = open(filepath, "wb")
+                f.write(buf)
+                f.close()
+
+                # create postprocess and save nodes
+                # create image input node for remote render result
+                bpy.ops.image.open(filepath=filepath)
+                if image_in_node is None:
+                    image_in_node = scene.node_tree.nodes.new(type='CompositorNodeImage')
+                    image_in_node.image = bpy.data.images['netrender_output.exr']
+                    image_in_node.layer = 'RenderLayer'
+                    image_in_node.name = 'LF_IMAGE_INPUT'
+
+                # create image output node
+                if image_out_node is None:
+                    image_out_node = scene.node_tree.nodes.new(type='CompositorNodeOutputFile')
+                    image_out_node.format.file_format = 'PNG'
+                    image_out_node.format.color_mode = 'RGB'
+                    image_out_node.format.color_depth = '8'
+                    image_out_node.name = 'LF_IMAGE_OUTPUT'
+
+                # connect nodes
+                right = image_in_node.outputs['Combined']
+                left = image_out_node.inputs['Image']
+                scene.node_tree.links.new(right, left)
+
+                scene.render.filepath = os.path.join(bpy.path.abspath(LF.tgt_dir),
+                                                                          "unused_blenderender_output")
+
+                # rename rendered file appropriately
+                image_filename = 'input_' + self.get_raw_camera_name(camera.name)
+                image_out_node.file_slots[c_image].path = image_filename + '_frame###'
+                c_image = image_filename + '_frame###'
+
+                image_out_node.base_path = tgt_dir
+                bpy.ops.render.render(write_still=True)
+                self.remove_blender_frame_from_file_name(image_filename, tgt_dir)
+
+            # restore previous status
+            bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].mute = current_rlayers_status
+            bpy.context.scene.render.engine = 'NET_RENDER'
+            scene.network_render.save_before_job = current_save_status
+            bpy.ops.wm.save_mainfile()
+
+            # remove unused files
+            os.remove(os.path.join(bpy.path.abspath(LF.tgt_dir), 'netrender_output.exr'))
+            os.remove(os.path.join(bpy.path.abspath(LF.tgt_dir), 'unused_blenderender_output.png'))
+
+            # remove nodes
+            bpy.context.scene.node_tree.nodes.remove(image_in_node)
+            bpy.context.scene.node_tree.nodes.remove(image_out_node)
+
 
     def render_object_id_maps(self, cameras, scene_key, LF, tgt_dir):
         bpy.data.scenes[bpy.context.scene.name].render.layers["RenderLayer"].use_pass_object_index = True
-
-        # prepare nodes for object id map
-        oid_out_node = bpy.data.scenes[scene_key].node_tree.nodes.new(type='CompositorNodeOutputFile')
-        oid_out_node.format.file_format = 'PNG'
-        oid_out_node.format.color_depth = '16'
-        oid_out_node.format.color_mode = 'BW'
-        oid_out_node.name = 'LF_OID_OUTPUT'
-
-        oid_math_node = bpy.data.scenes[scene_key].node_tree.nodes.new(type='CompositorNodeMath')
-        oid_math_node.operation = 'DIVIDE'
-        oid_math_node.inputs[1].default_value = 2 ** 16 - 1
-        oid_math_node.name = 'LF_OID_MATH'
-
-        right = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs['IndexOB']
-        math_left = oid_math_node.inputs[0]
-        math_right = oid_math_node.outputs[0]
-        left = oid_out_node.inputs['Image']
-
-        bpy.data.scenes[scene_key].node_tree.links.new(right, math_left)
-        bpy.data.scenes[scene_key].node_tree.links.new(math_right, left)
-        oid_out_node.base_path = tgt_dir
-        out_oid = oid_out_node.file_slots['Image']
 
         # assign an object id to all scene objects
         idx = 1
@@ -497,102 +581,331 @@ class OBJECT_OT_render_lightfield(bpy.types.Operator):
                 obj.pass_index = idx
                 idx += 1
 
-        # save object id map for each camera
-        for camera in cameras:
-            print("Rendering object id map with camera: " + camera.name)
-            oid_filename = 'objectids_highres_' + self.get_raw_camera_name(camera.name)
-            out_oid.path = oid_filename + "_frame###"
+        if not bpy.data.scenes[scene_key].LF.render_on_network:
+            # prepare nodes for object id map
+            oid_out_node = bpy.data.scenes[scene_key].node_tree.nodes.new(type='CompositorNodeOutputFile')
+            oid_out_node.format.file_format = 'PNG'
+            oid_out_node.format.color_depth = '16'
+            oid_out_node.format.color_mode = 'BW'
+            oid_out_node.name = 'LF_OID_OUTPUT'
 
-            # set scene camera to current light field camera
-            bpy.data.scenes[scene_key].camera = camera
+            oid_math_node = bpy.data.scenes[scene_key].node_tree.nodes.new(type='CompositorNodeMath')
+            oid_math_node.operation = 'DIVIDE'
+            oid_math_node.inputs[1].default_value = 2 ** 16 - 1
+            oid_math_node.name = 'LF_OID_MATH'
 
-            # render scene and adjust the file name
-            bpy.ops.render.render(write_still=True)
-            self.remove_blender_frame_from_file_name(oid_filename, tgt_dir)
+            right = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs['IndexOB']
+            math_left = oid_math_node.inputs[0]
+            math_right = oid_math_node.outputs[0]
+            left = oid_out_node.inputs['Image']
 
-        # handle additional "standard" center view object id map
-        center_camera = LF.get_center_camera()
-        src = os.path.join(tgt_dir, 'objectids_highres_%s.png' % self.get_raw_camera_name(center_camera.name))
-        tgt = os.path.join(tgt_dir, 'objectids_highres.png')
+            bpy.data.scenes[scene_key].node_tree.links.new(right, math_left)
+            bpy.data.scenes[scene_key].node_tree.links.new(math_right, left)
+            oid_out_node.base_path = tgt_dir
+            out_oid = oid_out_node.file_slots['Image']
 
-        # remove file with final filename if it exists
-        # (necessary for Windows systems where renaming is not an atomic operation)
-        try:
-            os.remove(tgt)
-        except:
-            pass
+            # save object id map for each camera
+            for camera in cameras:
+                print("Rendering object id map with camera: " + camera.name)
+                oid_filename = 'objectids_highres_' + self.get_raw_camera_name(camera.name)
+                out_oid.path = oid_filename + "_frame###"
 
-        if LF.save_object_id_maps_for_all_views:
-            shutil.copy(src, tgt)
-        else:
-            os.rename(src, tgt)
+                # set scene camera to current light field camera
+                bpy.data.scenes[scene_key].camera = camera
 
-        # remove the oid output node
-        bpy.context.scene.node_tree.nodes.remove(oid_out_node)
+                # render scene and adjust the file name
+                bpy.ops.render.render(write_still=True)
+                self.remove_blender_frame_from_file_name(oid_filename, tgt_dir)
 
-    def render_depth_and_disp_maps(self, cameras, scene_key, LF, tgt_dir):
+            # handle additional "standard" center view object id map
+            center_camera = LF.get_center_camera()
+            src = os.path.join(tgt_dir, 'objectids_highres_%s.png' % self.get_raw_camera_name(center_camera.name))
+            tgt = os.path.join(tgt_dir, 'objectids_highres.png')
+
+            # remove file with final filename if it exists
+            # (necessary for Windows systems where renaming is not an atomic operation)
+            try:
+                os.remove(tgt)
+            except:
+                pass
+
+            if LF.save_object_id_maps_for_all_views:
+                shutil.copy(src, tgt)
+            else:
+                os.rename(src, tgt)
+
+            # remove the oid output nodes
+            bpy.context.scene.node_tree.nodes.remove(oid_out_node)
+            bpy.context.scene.node_tree.nodes.remove(oid_math_node)
+
+        else:  # NET_RENDER
+            import netrender
+
+            scene = bpy.data.scenes[scene_key]
+            current_rlayers_status = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].mute
+            current_save_status = scene.network_render.save_before_job
+
+            scene.network_render.save_before_job = True
+            bpy.context.scene.render.engine = 'BLENDER_RENDER'
+
+            # send render jobs to the network
+            networkjoblist = []
+            for cam_idx, camera in enumerate(cameras):
+                print("Rendering object id map with camera: " + camera.name)
+                # set scene camera to current light field camera
+                bpy.data.scenes[scene_key].camera = camera
+
+                # send to render on the network
+                conn = netrender.utils.clientConnection(scene.network_render, report=self.report)
+                job_id = netrender.client.sendJob(conn, scene, False)
+                networkjoblist.append(job_id)
+                print("Job sent to master")
+
+            image_in_node = None
+            oid_out_node = None
+            oid_math_node = None
+            out_oid = None
+
+            bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].mute = True
+
+            for cam_idx, camera in enumerate(cameras):
+                print("Waiting for result of camera {}...".format(cam_idx))
+                job_id = networkjoblist[cam_idx]
+                netrender.client.requestResult(conn, job_id, scene.frame_current)
+                response = conn.getresponse()
+                buf = response.read()
+
+                while response.status == 202:
+                    sleep(1)
+                    netrender.client.requestResult(conn, job_id, scene.frame_current)
+                    response = conn.getresponse()
+                    buf = response.read()
+
+                print("Writing netrender result...")
+                filepath = os.path.join(bpy.path.abspath(LF.tgt_dir), 'netrender_output.exr')
+                f = open(filepath, "wb")
+                f.write(buf)
+                f.close()
+
+                # create image input node for remote render result
+                bpy.ops.image.open(filepath=filepath)
+                if image_in_node is None:
+                    image_in_node = scene.node_tree.nodes.new(type='CompositorNodeImage')
+                    image_in_node.image = bpy.data.images['netrender_output.exr']
+                    image_in_node.layer = 'RenderLayer'
+                    image_in_node.name = 'LF_IMAGE_INPUT'
+
+                # prepare nodes for object id map
+                if oid_out_node is None:
+                    oid_out_node = bpy.data.scenes[scene_key].node_tree.nodes.new(type='CompositorNodeOutputFile')
+                    oid_out_node.format.file_format = 'PNG'
+                    oid_out_node.format.color_depth = '16'
+                    oid_out_node.format.color_mode = 'BW'
+                    oid_out_node.name = 'LF_OID_OUTPUT'
+                    out_oid = oid_out_node.file_slots['Image']
+
+                if oid_math_node is None:
+                    oid_math_node = bpy.data.scenes[scene_key].node_tree.nodes.new(type='CompositorNodeMath')
+                    oid_math_node.operation = 'DIVIDE'
+                    oid_math_node.inputs[1].default_value = 2 ** 16 - 1
+                    oid_math_node.name = 'LF_OID_MATH'
+
+                right = image_in_node.outputs['IndexOB']
+                math_left = oid_math_node.inputs[0]
+                math_right = oid_math_node.outputs[0]
+                left = oid_out_node.inputs['Image']
+
+                bpy.data.scenes[scene_key].node_tree.links.new(right, math_left)
+                bpy.data.scenes[scene_key].node_tree.links.new(math_right, left)
+                oid_out_node.base_path = tgt_dir
+
+                oid_filename = 'objectids_highres_' + self.get_raw_camera_name(camera.name)
+                out_oid.path = oid_filename + "_frame###"
+
+                # render scene and adjust the file name
+                bpy.ops.render.render(write_still=True)
+                self.remove_blender_frame_from_file_name(oid_filename, tgt_dir)
+
+            # handle additional "standard" center view object id map
+            center_camera = LF.get_center_camera()
+            src = os.path.join(tgt_dir, 'objectids_highres_%s.png' % self.get_raw_camera_name(center_camera.name))
+            tgt = os.path.join(tgt_dir, 'objectids_highres.png')
+
+            # remove file with final filename if it exists
+            # (necessary for Windows systems where renaming is not an atomic operation)
+            try:
+                os.remove(tgt)
+            except:
+                pass
+
+            if LF.save_object_id_maps_for_all_views:
+                shutil.copy(src, tgt)
+            else:
+                os.rename(src, tgt)
+
+            # remove unused files
+            os.remove(os.path.join(bpy.path.abspath(LF.tgt_dir), 'netrender_output.exr'))
+            os.remove(os.path.join(bpy.path.abspath(LF.tgt_dir), 'unused_blenderender_output.png'))
+
+            bpy.context.scene.node_tree.nodes.remove(image_in_node)
+            bpy.context.scene.node_tree.nodes.remove(oid_math_node)
+            bpy.context.scene.node_tree.nodes.remove(oid_out_node)
+
+            bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].mute = current_rlayers_status
+            scene.network_render.save_before_job = current_save_status
+
+    def save_and_scale_depth(self, camera, depth, LF, tgt_dir):
         max_res = max(LF.x_res, LF.y_res)
         factor = LF.baseline_x_m * LF.focal_length * LF.focus_dist * max_res
 
-        # prepare depth output node. blender changed their naming convection for render layers in 2.79... so Z became Depth and everthing else got complicated ;)
-        if 'Z' in bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs:
-            right = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs['Z']
-        else:
-            right = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs['Depth']
-            
-        depth_view_node = bpy.data.scenes[scene_key].node_tree.nodes.new('CompositorNodeViewer')
-        depth_view_node.use_alpha = False
-        depth_view_node.name = 'LF_DEPTH_VIEW'
-        left = depth_view_node.inputs[0]
-        bpy.data.scenes[scene_key].node_tree.links.new(right, left)
+        # reshape high resolution depth map
+        depth = depth.reshape((int(LF.y_res * LF.depth_map_scale), int(LF.x_res * LF.depth_map_scale)))
 
-        for camera in cameras:
-            print("Rendering depth map with camera: " + camera.name)
+        # create depth map with original (low) resolution
+        depth_small = median_downsampling(depth, LF.depth_map_scale, LF.depth_map_scale)
 
-            # set scene camera to current light field camera
-            bpy.data.scenes[scene_key].camera = camera
+        # check if high resolution depth map has depth artifacts on individual pixels
+        min_depth = np.min(depth_small)
+        max_depth = np.max(depth_small)
+        m_out_of_range = (depth < 0.9 * min_depth) + (depth > 1.1 * max_depth)
 
-            # render scene and extract depth map to numpy array
-            bpy.ops.render.render(write_still=True)
-            pixels = bpy.data.images['Viewer Node'].pixels  # size is width * height * 4 (rgba)
-            depth = np.array(pixels)[::4]
-
-            # reshape high resolution depth map
-            depth = depth.reshape((int(LF.y_res * LF.depth_map_scale), int(LF.x_res * LF.depth_map_scale)))
-
-            # create depth map with original (low) resolution
+        if np.sum(m_out_of_range) > 0:
+            depth = self.fix_pixel_artefacts(depth, m_out_of_range)
             depth_small = median_downsampling(depth, LF.depth_map_scale, LF.depth_map_scale)
 
-            # check if high resolution depth map has depth artifacts on individual pixels
-            min_depth = np.min(depth_small)
-            max_depth = np.max(depth_small)
-            m_out_of_range = (depth < 0.9*min_depth) + (depth > 1.1*max_depth)
+        # create disparity maps
+        disp = (factor / depth - LF.baseline_x_m * LF.focal_length * max_res) / LF.focus_dist / LF.sensor_size
+        disp_small = median_downsampling(disp, LF.depth_map_scale, LF.depth_map_scale)
 
-            if np.sum(m_out_of_range) > 0:
-                depth = self.fix_pixel_artefacts(depth, m_out_of_range)
-                depth_small = median_downsampling(depth, LF.depth_map_scale, LF.depth_map_scale)
+        # set disparity range for config file
+        LF.min_disp = np.floor(np.amin(disp_small) * 10) / 10 - 0.1
+        LF.max_disp = np.ceil(np.amax(disp_small) * 10) / 10 + 0.1
 
-            # create disparity maps
-            disp = (factor / depth - LF.baseline_x_m * LF.focal_length * max_res) / LF.focus_dist / LF.sensor_size
-            disp_small = median_downsampling(disp, LF.depth_map_scale, LF.depth_map_scale)
+        # save disparity files
+        if camera.name == LF.get_center_camera().name:
+            write_pfm(depth, os.path.join(tgt_dir, 'gt_depth_highres.pfm'))
+            write_pfm(disp, os.path.join(tgt_dir, 'gt_disp_highres.pfm'))
+            write_pfm(depth_small, os.path.join(tgt_dir, 'gt_depth_lowres.pfm'))
+            write_pfm(disp_small, os.path.join(tgt_dir, 'gt_disp_lowres.pfm'))
 
-            # set disparity range for config file
-            LF.min_disp = np.floor(np.amin(disp_small) * 10) / 10 - 0.1
-            LF.max_disp = np.ceil(np.amax(disp_small) * 10) / 10 + 0.1
+        if LF.save_depth_for_all_views:
+            camera_name = self.get_raw_camera_name(camera.name)
+            write_pfm(depth, os.path.join(tgt_dir, 'gt_depth_highres_%s.pfm' % camera_name))
+            write_pfm(disp, os.path.join(tgt_dir, 'gt_disp_highres_%s.pfm' % camera_name))
+            write_pfm(depth_small, os.path.join(tgt_dir, 'gt_depth_lowres_%s.pfm' % camera_name))
+            write_pfm(disp_small, os.path.join(tgt_dir, 'gt_disp_lowres_%s.pfm' % camera_name))
 
-            # save disparity files
-            if camera.name == LF.get_center_camera().name:
-                write_pfm(depth, os.path.join(tgt_dir, 'gt_depth_highres.pfm'))
-                write_pfm(disp, os.path.join(tgt_dir, 'gt_disp_highres.pfm'))
-                write_pfm(depth_small, os.path.join(tgt_dir, 'gt_depth_lowres.pfm'))
-                write_pfm(disp_small, os.path.join(tgt_dir, 'gt_disp_lowres.pfm'))
+    def render_depth_and_disp_maps(self, cameras, scene_key, LF, tgt_dir):
+        if not bpy.data.scenes[scene_key].LF.render_on_network:
+            # prepare depth output node. blender changed their naming convention for render layers in 2.79... so Z became Depth and everthing else got complicated ;)
+            if 'Z' in bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs:
+                right = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs['Z']
+            else:
+                right = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].outputs['Depth']
 
-            if LF.save_depth_for_all_views:
-                camera_name = self.get_raw_camera_name(camera.name)
-                write_pfm(depth, os.path.join(tgt_dir, 'gt_depth_highres_%s.pfm' % camera_name))
-                write_pfm(disp, os.path.join(tgt_dir, 'gt_disp_highres_%s.pfm' % camera_name))
-                write_pfm(depth_small, os.path.join(tgt_dir, 'gt_depth_lowres_%s.pfm' % camera_name))
-                write_pfm(disp_small, os.path.join(tgt_dir, 'gt_disp_lowres_%s.pfm' % camera_name))
+            depth_view_node = bpy.data.scenes[scene_key].node_tree.nodes.new('CompositorNodeViewer')
+            depth_view_node.use_alpha = False
+            depth_view_node.name = 'LF_DEPTH_VIEW'
+            left = depth_view_node.inputs[0]
+            bpy.data.scenes[scene_key].node_tree.links.new(right, left)
+
+            for camera in cameras:
+                print("Rendering depth map with camera: " + camera.name)
+
+                # set scene camera to current light field camera
+                bpy.data.scenes[scene_key].camera = camera
+
+                # render scene and extract depth map to numpy array
+                bpy.ops.render.render(write_still=True)
+                pixels = bpy.data.images['Viewer Node'].pixels  # size is width * height * 4 (rgba)
+                depth = np.array(pixels)[::4]
+
+                self.save_and_scale_depth(camera, depth, LF, tgt_dir)
+
+        else:  # NET_RENDER
+            import netrender
+
+            scene = bpy.data.scenes[scene_key]
+            current_rlayers_status = bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].mute
+            current_save_status = scene.network_render.save_before_job
+
+            scene.network_render.save_before_job = True
+            bpy.context.scene.render.engine = 'BLENDER_RENDER'
+
+            networkjoblist = []
+            for camera in cameras:
+                print("Rendering depth map with camera: " + camera.name)
+                # set scene camera to current light field camera
+                bpy.data.scenes[scene_key].camera = camera
+
+                # send to render on the network
+                conn = netrender.utils.clientConnection(scene.network_render, report=self.report)
+                job_id = netrender.client.sendJob(conn, scene, False)
+                networkjoblist.append(job_id)
+                print("Job sent to master")
+
+            bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].mute = True
+            depth_view_node = None
+            image_in_node = None
+
+            for cam_idx, camera in enumerate(cameras):
+
+                print("Waiting for result of camera {}...".format(cam_idx))
+                job_id = networkjoblist[cam_idx]
+                netrender.client.requestResult(conn, job_id, scene.frame_current)
+                response = conn.getresponse()
+                buf = response.read()
+
+                while response.status == 202:
+                    sleep(1)
+                    netrender.client.requestResult(conn, job_id, scene.frame_current)
+                    response = conn.getresponse()
+                    buf = response.read()
+
+                print("Writing netrender result...")
+                filepath = os.path.join(bpy.path.abspath(LF.tgt_dir), 'netrender_output.exr')
+                f = open(filepath, "wb")
+                f.write(buf)
+                f.close()
+
+                # create image input node for remote render result
+                bpy.ops.image.open(filepath=filepath)
+                if image_in_node is None:
+                    image_in_node = scene.node_tree.nodes.new(type='CompositorNodeImage')
+                    image_in_node.image = bpy.data.images['netrender_output.exr']
+                    image_in_node.layer = 'RenderLayer'
+                    image_in_node.name = 'LF_IMAGE_INPUT'
+
+                if depth_view_node is None:
+                    # prepare depth output node. blender changed their naming convention for render layers in 2.79... so Z became Depth and everthing else got complicated ;)
+                    if 'Z' in image_in_node.outputs:
+                        right = image_in_node.outputs['Z']
+                    else:
+                        right = image_in_node.outputs['Depth']
+
+                    depth_view_node = bpy.data.scenes[scene_key].node_tree.nodes.new('CompositorNodeViewer')
+                    depth_view_node.use_alpha = False
+                    depth_view_node.name = 'LF_DEPTH_VIEW'
+                    left = depth_view_node.inputs[0]
+                    bpy.data.scenes[scene_key].node_tree.links.new(right, left)
+
+                # render scene and extract depth map to numpy array
+                bpy.ops.render.render(write_still=True)
+                pixels = bpy.data.images['Viewer Node'].pixels  # size is width * height * 4 (rgba)
+                depth = np.array(pixels)[::4]
+
+                self.save_and_scale_depth(camera, depth, LF, tgt_dir)
+
+            # remove unused files
+            os.remove(os.path.join(bpy.path.abspath(LF.tgt_dir), 'netrender_output.exr'))
+            os.remove(os.path.join(bpy.path.abspath(LF.tgt_dir), 'unused_blenderender_output.png'))
+
+            bpy.context.scene.node_tree.nodes.remove(image_in_node)
+            bpy.context.scene.node_tree.nodes.remove(depth_view_node)
+
+            bpy.data.scenes[scene_key].node_tree.nodes['Render Layers'].mute = current_rlayers_status
+            scene.network_render.save_before_job = current_save_status
+
 
     def fix_pixel_artefacts(self, disp, m_out_of_range, half_window=1):
         print("Fixing %d out of range pixel(s), values: %s" % (np.sum(m_out_of_range), list(disp[m_out_of_range])))
